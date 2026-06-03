@@ -20,11 +20,11 @@
     from https://github.com/Unmanic/unmanic-plugins (GPL-3).
 
     Changes from the original:
-      - Processes ALL audio languages in a single pass (not a single configured language).
-      - Includes streams with no language tag (grouped as "und").
-      - Does not require >4 channels; any non-AAC-stereo stream is re-encoded.
-      - Idempotent: groups already containing an AAC stereo track are skipped.
-      - The new AAC stereo track matching default_language is set as the default audio.
+      - Creates an AAC stereo clone for EVERY non-AAC-stereo audio stream (Variant B / per-track).
+      - All originals are kept; clones are appended at the end.
+      - Idempotent: existing clones are detected via UNMANIC_STEREO_SOURCE stream metadata tags.
+      - The default disposition is set on the clone of the source's own default track
+        (or the first language-matching clone, or the first clone as last resort).
 
 """
 import logging
@@ -42,12 +42,12 @@ logger = logging.getLogger("Unmanic.Plugin.add_stereo_aac_all_languages")
 
 class Settings(PluginSettings):
     settings = {
-        "audio_bitrate":   "128k",
+        "audio_bitrate":    "128k",
         "default_language": "rus",
-        "use_libfdk_aac":  False,
-        "skip_commentary": True,
-        "channels":        "",
-        "codec_name":      "",
+        "use_libfdk_aac":   False,
+        "skip_commentary":  True,
+        "channels":         "",
+        "codec_name":       "",
     }
 
     def __init__(self, *args, **kwargs):
@@ -90,75 +90,142 @@ def _normalize_lang(lang_str):
         return lang_str.lower()
 
 
+def _lang_display_name(lang_code):
+    """Return a human-readable language name, or None if und/unknown."""
+    if not lang_code or lang_code == "und":
+        return None
+    try:
+        if len(lang_code) == 2:
+            return iso639.Language.from_part1(lang_code).name
+        return iso639.Language.from_part3(lang_code).name
+    except Exception:
+        return lang_code
+
+
+def _compute_signature(stream, ordinal_counters):
+    """
+    Return a stable string signature for a source audio stream.
+
+    Uses the title tag when present.  Falls back to lang|codec|channels|ordinal
+    for untitled streams (best-effort — works reliably only when source order is stable).
+    """
+    title = stream.get("tags", {}).get("title", "")
+    if title:
+        return title
+    lang = stream.get("tags", {}).get("language") or "und"
+    codec = stream.get("codec_name", "")
+    channels = str(stream.get("channels", ""))
+    key = (lang, codec, channels)
+    ordinal = ordinal_counters.get(key, 0)
+    ordinal_counters[key] = ordinal + 1
+    return "{}|{}|{}|{}".format(lang, codec, channels, ordinal)
+
+
+def _build_cloned_signatures(audio_streams):
+    """
+    Return the set of source signatures already present as clones.
+
+    Reads the UNMANIC_STEREO_SOURCE tag (case-insensitive) from every audio stream.
+    Matroska uppercases custom tag keys, so ffprobe returns them uppercased regardless
+    of how they were written.
+    """
+    cloned = set()
+    for stream in audio_streams:
+        tags = stream.get("tags", {})
+        for key, val in tags.items():
+            if key.upper() == "UNMANIC_STEREO_SOURCE":
+                if val:
+                    cloned.add(val)
+                break
+    return cloned
+
+
 def select_streams(probe_streams, *, channels="", codec_name="", skip_commentary=True):
     """
     Return a list of audio-relative indices needing a stereo-AAC clone.
 
-    One index per uncovered language group (key "und" for untagged streams).
-    Idempotent: groups already containing an AAC stereo track are skipped.
+    Per-track semantics: every audio stream that is not already AAC stereo gets
+    its own clone, subject to the optional source filters.  Idempotent: streams
+    whose signatures are recorded in an existing UNMANIC_STEREO_SOURCE tag are skipped.
     """
-    # Collect audio streams in source order with their audio-relative index.
-    audio_streams = []
-    for stream in probe_streams:
-        if stream.get("codec_type") == "audio":
-            audio_streams.append(stream)
+    audio_streams = [s for s in probe_streams if s.get("codec_type") == "audio"]
+    cloned_signatures = _build_cloned_signatures(audio_streams)
 
-    # Group by language, filtering commentary tracks before grouping so they
-    # don't count toward "already covered" coverage either.
-    groups = {}  # lang -> [(audio_idx, stream), ...]
+    # Pre-compute signatures for all audio streams (ordinal counter tracks
+    # untitled streams with identical lang+codec+channels).
+    ordinal_counters = {}
+    source_sigs = [_compute_signature(s, ordinal_counters) for s in audio_streams]
+
+    selected = []
     for audio_idx, stream in enumerate(audio_streams):
+        # Rule 1: skip streams already in AAC stereo format.
+        if stream.get("codec_name") == "aac" and stream.get("channels") == 2:
+            continue
+
+        # Rule 2: optional commentary skip.
         if skip_commentary:
             title = stream.get("tags", {}).get("title", "")
             if "commentary" in title.lower():
                 continue
-        lang = stream.get("tags", {}).get("language") or "und"
-        if lang not in groups:
-            groups[lang] = []
-        groups[lang].append((audio_idx, stream))
 
-    selected = []
-    for lang, streams_in_group in groups.items():
-        # Already covered: group contains at least one AAC stereo stream.
-        already_covered = any(
-            s.get("codec_name") == "aac"
-            and s.get("channels") == 2
-            and s.get("channel_layout", "stereo") == "stereo"
-            for _, s in streams_in_group
-        )
-        if already_covered:
+        # Rule 3: optional source-codec filter.
+        if codec_name and stream.get("codec_name", "") != codec_name:
             continue
 
-        # Apply optional source filters.
-        eligible = [
-            (idx, s) for idx, s in streams_in_group
-            if (not channels or str(s.get("channels", "")) == str(channels))
-            and (not codec_name or s.get("codec_name", "") == codec_name)
-        ]
-        if not eligible:
+        # Rule 4: optional source-channels filter.
+        if channels and str(stream.get("channels", "")) != str(channels):
             continue
 
-        # Highest channel count wins; first occurrence breaks ties (max() is stable).
-        best_idx, _ = max(eligible, key=lambda x: x[1].get("channels", 0))
-        selected.append(best_idx)
+        # Rule 5: idempotency — skip if a clone already exists for this source.
+        if source_sigs[audio_idx] in cloned_signatures:
+            continue
+
+        selected.append(audio_idx)
 
     return selected
 
 
 def pick_default_output_index(selected_indices, original_audio_count, default_language, probe_streams):
     """
-    Return the output audio index (original_audio_count + k) that should receive
-    the default disposition.  Falls back to the first clone if no match found.
+    Return the output audio index that should receive the default disposition.
+
+    Priority order:
+    1. Clone of the source stream that had disposition.default == 1.
+       If that stream was already AAC stereo (not cloned), use its own output index.
+    2. First AAC stereo track (clone or existing) whose language matches default_language.
+    3. First created clone.
     """
     audio_streams = [s for s in probe_streams if s.get("codec_type") == "audio"]
-    target = _normalize_lang(default_language)
 
+    # Priority 1: find the source-default stream.
+    for audio_idx, stream in enumerate(audio_streams):
+        if stream.get("disposition", {}).get("default") == 1:
+            if audio_idx in selected_indices:
+                k = list(selected_indices).index(audio_idx)
+                return original_audio_count + k
+            # Already AAC stereo — keep its own (pass-through) output audio index.
+            if stream.get("codec_name") == "aac" and stream.get("channels") == 2:
+                return audio_idx
+            # Filtered out (commentary, codec, channels) — fall through to priority 2.
+            break
+
+    # Priority 2: first clone or existing AAC stereo whose language matches default_language.
+    target = _normalize_lang(default_language)
     if target is not None:
+        # Check clones first.
         for k, audio_idx in enumerate(selected_indices):
             stream = audio_streams[audio_idx]
             stream_lang = stream.get("tags", {}).get("language", "und")
             if _normalize_lang(stream_lang) == target:
                 return original_audio_count + k
+        # Then existing AAC stereo tracks (not cloned).
+        for audio_idx, stream in enumerate(audio_streams):
+            if stream.get("codec_name") == "aac" and stream.get("channels") == 2:
+                stream_lang = stream.get("tags", {}).get("language", "und")
+                if _normalize_lang(stream_lang) == target:
+                    return audio_idx
 
+    # Priority 3: first clone.
     return original_audio_count
 
 
@@ -242,12 +309,12 @@ def on_worker_process(data):
     else:
         settings = Settings()
 
-    audio_bitrate = settings.get_setting('audio_bitrate') or '128k'
+    audio_bitrate   = settings.get_setting('audio_bitrate') or '128k'
     default_language = (settings.get_setting('default_language') or '').lower()
-    encoder = 'libfdk_aac' if settings.get_setting('use_libfdk_aac') else 'aac'
-    skip_commentary = settings.get_setting('skip_commentary')
-    channels = settings.get_setting('channels') or ''
-    codec_name = (settings.get_setting('codec_name') or '').lower()
+    encoder          = 'libfdk_aac' if settings.get_setting('use_libfdk_aac') else 'aac'
+    skip_commentary  = settings.get_setting('skip_commentary')
+    channels         = settings.get_setting('channels') or ''
+    codec_name       = (settings.get_setting('codec_name') or '').lower()
 
     selected = select_streams(
         probe_streams,
@@ -263,6 +330,12 @@ def on_worker_process(data):
     original_audio_count = sum(1 for s in probe_streams if s.get("codec_type") == "audio")
     audio_streams = [s for s in probe_streams if s.get("codec_type") == "audio"]
 
+    # Pre-compute signatures for all audio streams so we can tag each clone.
+    sig_counters = {}
+    source_sigs = [_compute_signature(s, sig_counters) for s in audio_streams]
+
+    encoder_label = encoder.upper()
+
     ffmpeg_args = [
         '-hide_banner', '-loglevel', 'info',
         '-i', str(abspath),
@@ -274,6 +347,8 @@ def on_worker_process(data):
         out_a = original_audio_count + k
         stream = audio_streams[sel]
         lang = stream.get("tags", {}).get("language") or "und"
+        source_title = stream.get("tags", {}).get("title", "")
+        sig = source_sigs[sel]
 
         ffmpeg_args += [
             '-map', '0:a:{}'.format(sel),
@@ -284,25 +359,24 @@ def on_worker_process(data):
 
         if lang != "und":
             ffmpeg_args += ['-metadata:s:a:{}'.format(out_a), 'language={}'.format(lang)]
-            try:
-                if len(lang) == 2:
-                    lang_obj = iso639.Language.from_part1(lang)
-                elif len(lang) == 3:
-                    lang_obj = iso639.Language.from_part3(lang)
-                else:
-                    lang_obj = None
-                lang_name = lang_obj.name if lang_obj else lang
-            except Exception:
-                lang_name = lang
-            title = '{} ({} Stereo)'.format(lang_name, encoder.upper())
-        else:
-            title = 'Stereo ({})'.format(encoder.upper())
 
-        ffmpeg_args += ['-metadata:s:a:{}'.format(out_a), 'title={}'.format(title)]
+        if source_title:
+            clone_title = '{} ({} Stereo)'.format(source_title, encoder_label)
+        else:
+            lang_name = _lang_display_name(lang)
+            if lang_name:
+                clone_title = '{} ({} Stereo)'.format(lang_name, encoder_label)
+            else:
+                clone_title = 'Stereo ({})'.format(encoder_label)
+
+        ffmpeg_args += [
+            '-metadata:s:a:{}'.format(out_a), 'title={}'.format(clone_title),
+            '-metadata:s:a:{}'.format(out_a), 'UNMANIC_STEREO_SOURCE={}'.format(sig),
+        ]
 
     chosen_out_a = pick_default_output_index(selected, original_audio_count, default_language, probe_streams)
     ffmpeg_args += [
-        '-disposition:a', '-default',
+        '-disposition:a', '0',
         '-disposition:a:{}'.format(chosen_out_a), 'default',
     ]
 

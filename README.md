@@ -1,7 +1,8 @@
 # unmanic-plugin-stereo-aac-all-langs
 
-An [Unmanic](https://unmanic.app) plugin that adds a stereo AAC track for **every** audio language
-in a file — including streams with no language tag — while leaving all originals untouched.
+An [Unmanic](https://unmanic.app) plugin that adds an AAC stereo clone for **every**
+non-AAC-stereo audio stream in a file — one per dub, one per language track — while leaving
+all originals untouched.
 
 Fork of [`add_extra_stereo_audio`](https://github.com/Unmanic/unmanic-plugins/tree/official/source/add_extra_stereo_audio)
 by Josh Sunnex and yajrendrag (GPL-3).
@@ -10,24 +11,43 @@ by Josh Sunnex and yajrendrag (GPL-3).
 
 ## Why
 
-Jellyfin clients on Android and many TVs cannot DirectPlay AC3 / EAC3 / DTS audio.  
+Jellyfin clients on Android and many TVs cannot DirectPlay AC3 / EAC3 / DTS audio.
 Without a compatible track the server must transcode, wasting CPU and reducing quality.
 
-This plugin appends a stereo AAC clone per language so every client can DirectPlay without
-removing the surround original.  The new AAC track is set as the **default audio** so clients
-with no AAC support for the surround track pick it automatically.
+This plugin appends a stereo AAC clone **per stream** so every dub and every language can be
+DirectPlayed without removing the surround originals.  
+The new default audio is set on the clone of whichever track was already the default in the
+source file, so clients with no AAC support for the surround track pick it automatically.
 
 ---
 
-## Differences from the original
+## Per-track cloning (Variant B)
 
-| Feature | `add_extra_stereo_audio` | this plugin |
-|---|---|---|
-| Languages processed | one (configured) | **all**, in a single pass |
-| Untagged streams | skipped | **included** (grouped as `und`) |
-| Minimum channels | >4 | **none** — stereo AC3/DTS also re-encoded |
-| Idempotent | per configured language | per language group |
-| Default audio | optional | **always** set on the matching AAC clone |
+Unlike approaches that create one clone per language group, this plugin clones **every**
+individual non-AAC-stereo stream.
+
+**Example — Dune Part Two (11 audio streams, 9 Russian dubs):**
+
+| # | Source | Action |
+|---|--------|--------|
+| 1 | eac3 6ch rus "Дубляж (Bravo Records)" ★ default | → cloned as "Дубляж (Bravo Records) (AAC Stereo)" ★ new default |
+| 2 | ac3  6ch rus "Дубляж (Red Head Sound)" | → cloned |
+| 3 | ac3  2ch rus "Дубляж (Jaskier)" | → cloned |
+| 4 | aac  2ch rus "Дубляж (HDRezka Studio)" | left alone (already AAC stereo) |
+| 5–9 | … 5 more rus tracks | → cloned (×5) |
+| 10 | ac3  6ch ukr "Postmodern" | → cloned |
+| 11 | eac3 6ch eng "Original English Atmos" | → cloned |
+
+Result: 10 new AAC stereo tracks appended, default on the Bravo Records clone.  
+**Note:** this intentionally produces many tracks on multi-dub releases.
+
+---
+
+## Idempotency
+
+Each created clone is tagged with `UNMANIC_STEREO_SOURCE=<signature>` in its stream metadata.
+On re-runs the plugin reads these tags and skips any source whose clone already exists —
+running on the same file twice is safe and adds nothing.
 
 ---
 
@@ -36,7 +56,7 @@ with no AAC support for the surround track pick it automatically.
 | Setting | Default | Description |
 |---|---|---|
 | `audio_bitrate` | `128k` | Bitrate for each created stereo AAC track |
-| `default_language` | `rus` | Language of the AAC clone to mark as default audio; accepts ISO 639-1 (`ru`) or ISO 639-2 (`rus`) |
+| `default_language` | `rus` | Fallback language for default-audio selection when the source has no default disposition; accepts ISO 639-1 (`ru`) or ISO 639-2 (`rus`) |
 | `use_libfdk_aac` | `false` | Use `libfdk_aac` encoder; requires an FFmpeg build with libfdk support. Falls back to native `aac` if unchecked. |
 | `skip_commentary` | `true` | Skip streams whose title contains "commentary" (case-insensitive) |
 | `channels` | *(empty)* | Optional: restrict source streams to this exact channel count |
@@ -46,20 +66,24 @@ with no AAC support for the surround track pick it automatically.
 
 ## What the ffmpeg command looks like
 
-For a file with `rus EAC3 5.1` + `eng AC3 5.1` and `default_language=rus`:
+For a file with `rus EAC3 5.1 "Дубляж"` + `eng AC3 5.1` and `default_language=rus`:
 
 ```
 ffmpeg -hide_banner -loglevel info -i input.mkv -max_muxing_queue_size 9999 \
   -map 0 -c copy \
   -map 0:a:0 -c:a:2 aac -ac 2 -b:a:2 128k \
-      -metadata:s:a:2 language=rus -metadata:s:a:2 "title=Russian (AAC Stereo)" \
+      -metadata:s:a:2 language=rus \
+      -metadata:s:a:2 "title=Дубляж (AAC Stereo)" \
+      -metadata:s:a:2 "UNMANIC_STEREO_SOURCE=Дубляж" \
   -map 0:a:1 -c:a:3 aac -ac 2 -b:a:3 128k \
-      -metadata:s:a:3 language=eng -metadata:s:a:3 "title=English (AAC Stereo)" \
-  -disposition:a -default -disposition:a:2 default \
+      -metadata:s:a:3 language=eng \
+      -metadata:s:a:3 "title=English (AAC Stereo)" \
+      -metadata:s:a:3 "UNMANIC_STEREO_SOURCE=und|ac3|6|0" \
+  -disposition:a 0 -disposition:s:a:2 default \
   -y output.mkv
 ```
 
-Re-running on `output.mkv` adds nothing (idempotent).
+Re-running on `output.mkv` detects the `UNMANIC_STEREO_SOURCE` tags and adds nothing.
 
 ---
 
@@ -121,7 +145,7 @@ python3 -m venv .venv
 .venv/bin/python -m pytest tests/ -v
 ```
 
-All 16 tests cover the selection and disposition logic without requiring Unmanic installed.
+All tests cover the selection and disposition logic without requiring Unmanic installed.
 
 ---
 
